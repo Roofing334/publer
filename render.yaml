@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: sands-publer-mcp
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 24
+      - key: PUBLER_API_BASE
+        value: https://app.publer.com/api/v1
+      - key: PUBLER_API_KEY
+        sync: false
+      - key: MCP_AUTH_TOKEN
+        sync: false
+      - key: PUBLER_WORKSPACE_ID
+        sync: false
