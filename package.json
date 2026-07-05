@@ -1,0 +1,19 @@
+{
+  "name": "sands-publer-mcp",
+  "version": "1.0.0",
+  "description": "Publer MCP server for Sands Roofing",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "publer",
+    "sands-roofing"
+  ],
+  "license": "UNLICENSED"
+}
