@@ -1,123 +1,24 @@
+import { createServer } from "node:http";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z } from "zod";
+
 const PORT = Number(process.env.PORT || 3000);
+const MCP_PATH = "/mcp";
 const PUBLER_API_BASE = process.env.PUBLER_API_BASE || "https://app.publer.com/api/v1";
 const PUBLER_API_KEY = process.env.PUBLER_API_KEY;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const DEFAULT_WORKSPACE_ID = process.env.PUBLER_WORKSPACE_ID;
 
-const serverInfo = {
-  name: "sands-publer-mcp",
-  version: "1.0.0",
-};
-
-const toolDefinitions = [
-  {
-    name: "list_workspaces",
-    description: "List Publer workspaces available to the configured Publer API key.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "list_accounts",
-    description: "List social accounts connected to a Publer workspace.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        workspace_id: { type: "string", description: "Publer workspace ID. Defaults to PUBLER_WORKSPACE_ID when configured." },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "list_posts",
-    description: "List Publer posts by state, account, date range, query, post type, or creator.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        workspace_id: { type: "string", description: "Publer workspace ID. Defaults to PUBLER_WORKSPACE_ID when configured." },
-        state: { type: "string", description: "Post state such as scheduled, published, draft, failed, or all." },
-        from: { type: "string", description: "ISO date or datetime for start of range." },
-        to: { type: "string", description: "ISO date or datetime for end of range." },
-        page: { type: "integer", description: "Page number." },
-        account_ids: { type: "array", items: { type: "string" }, description: "Publer account IDs to filter by." },
-        query: { type: "string", description: "Full-text post search." },
-        postType: { type: "string", description: "Post type such as status, link, photo, video, reel, story, carousel, article." },
-        member_id: { type: "string", description: "Workspace member ID." },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "create_draft_post",
-    description: "Create a Publer draft post through /posts/schedule. Defaults bulk.state to draft when not provided.",
-    inputSchema: {
-      type: "object",
-      required: ["bulk"],
-      properties: {
-        workspace_id: { type: "string", description: "Publer workspace ID. Defaults to PUBLER_WORKSPACE_ID when configured." },
-        bulk: { type: "object", description: "Publer bulk payload. Include posts, networks, and accounts." },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "schedule_post",
-    description: "Schedule an approved Publer post through /posts/schedule. Requires confirmed=true.",
-    inputSchema: {
-      type: "object",
-      required: ["bulk", "confirmed"],
-      properties: {
-        workspace_id: { type: "string", description: "Publer workspace ID. Defaults to PUBLER_WORKSPACE_ID when configured." },
-        bulk: { type: "object", description: "Publer bulk payload with state scheduled and scheduled_at values on accounts." },
-        confirmed: { type: "boolean", description: "Must be true after final copy, accounts, media, and schedule time are approved." },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "publish_now",
-    description: "Immediately publish an approved Publer post through /posts/schedule/publish. Requires confirmed=true.",
-    inputSchema: {
-      type: "object",
-      required: ["bulk", "confirmed"],
-      properties: {
-        workspace_id: { type: "string", description: "Publer workspace ID. Defaults to PUBLER_WORKSPACE_ID when configured." },
-        bulk: { type: "object", description: "Publer bulk payload with posts, networks, and accounts." },
-        confirmed: { type: "boolean", description: "Must be true after final copy, accounts, and media are approved for immediate publishing." },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "get_job_status",
-    description: "Check Publer async job status after creating, scheduling, or publishing posts.",
-    inputSchema: {
-      type: "object",
-      required: ["job_id"],
-      properties: {
-        workspace_id: { type: "string", description: "Publer workspace ID. Defaults to PUBLER_WORKSPACE_ID when configured." },
-        job_id: { type: "string", description: "Publer job ID returned by a create/schedule/publish request." },
-      },
-      additionalProperties: false,
-    },
-  },
-];
-
-function jsonResponse(res, status, body) {
-  const payload = body === undefined ? "" : JSON.stringify(body);
+function json(res, status, body) {
   res.writeHead(status, {
-    "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "content-type, authorization, x-mcp-auth",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "content-type": "application/json",
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "POST, GET, DELETE, OPTIONS",
+    "access-control-allow-headers": "content-type, mcp-session-id, authorization, x-mcp-auth",
+    "access-control-expose-headers": "Mcp-Session-Id",
   });
-  res.end(payload);
-}
-
-function unauthorized(res) {
-  jsonResponse(res, 401, { error: "Unauthorized" });
+  res.end(body === undefined ? "" : JSON.stringify(body));
 }
 
 function isAuthorized(req) {
@@ -125,28 +26,6 @@ function isAuthorized(req) {
   const auth = req.headers.authorization || "";
   const xAuth = req.headers["x-mcp-auth"] || "";
   return auth === `Bearer ${MCP_AUTH_TOKEN}` || xAuth === MCP_AUTH_TOKEN;
-}
-
-function parseBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (chunk) => {
-      data += chunk;
-      if (data.length > 2_000_000) {
-        reject(new Error("Request body too large"));
-        req.destroy();
-      }
-    });
-    req.on("end", () => {
-      if (!data) return resolve({});
-      try {
-        resolve(JSON.parse(data));
-      } catch (error) {
-        reject(new Error("Invalid JSON body"));
-      }
-    });
-    req.on("error", reject);
-  });
 }
 
 function requireApiKey() {
@@ -213,137 +92,241 @@ async function publerRequest({ method, path, workspaceId, query, body }) {
   return data;
 }
 
-async function callTool(name, args = {}) {
-  switch (name) {
-    case "list_workspaces":
-      return publerRequest({ method: "GET", path: "/workspaces" });
+function textResult(data) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: typeof data === "string" ? data : JSON.stringify(data, null, 2),
+      },
+    ],
+  };
+}
 
-    case "list_accounts":
-      return publerRequest({ method: "GET", path: "/accounts", workspaceId: requireWorkspace(args) });
+function errorResult(error) {
+  return {
+    isError: true,
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({ error: error.message, details: error.details }, null, 2),
+      },
+    ],
+  };
+}
 
-    case "list_posts": {
+async function runSafely(handler) {
+  try {
+    return textResult(await handler());
+  } catch (error) {
+    return errorResult(error);
+  }
+}
+
+const workspaceSchema = {
+  workspace_id: z.string().optional().describe("Publer workspace ID. Defaults to PUBLER_WORKSPACE_ID when configured."),
+};
+
+const bulkSchema = z.record(z.any()).describe("Publer bulk payload. Include state, posts, networks, accounts, and scheduling fields as needed.");
+
+function createPublerServer() {
+  const server = new McpServer({
+    name: "sands-publer-mcp",
+    version: "1.0.0",
+  });
+
+  server.registerTool(
+    "list_workspaces",
+    {
+      title: "List Publer workspaces",
+      description: "List Publer workspaces available to the configured Publer API key.",
+      inputSchema: {},
+    },
+    async () => runSafely(() => publerRequest({ method: "GET", path: "/workspaces" }))
+  );
+
+  server.registerTool(
+    "list_accounts",
+    {
+      title: "List Publer accounts",
+      description: "List social accounts connected to a Publer workspace.",
+      inputSchema: workspaceSchema,
+    },
+    async (args) => runSafely(() => publerRequest({ method: "GET", path: "/accounts", workspaceId: requireWorkspace(args) }))
+  );
+
+  server.registerTool(
+    "list_posts",
+    {
+      title: "List Publer posts",
+      description: "List Publer posts by state, account, date range, query, post type, or creator.",
+      inputSchema: {
+        ...workspaceSchema,
+        state: z.string().optional().describe("Post state such as scheduled, published, draft, failed, or all."),
+        from: z.string().optional().describe("ISO date or datetime for start of range."),
+        to: z.string().optional().describe("ISO date or datetime for end of range."),
+        page: z.number().int().optional().describe("Page number."),
+        account_ids: z.array(z.string()).optional().describe("Publer account IDs to filter by."),
+        query: z.string().optional().describe("Full-text post search."),
+        postType: z.string().optional().describe("Post type such as status, link, photo, video, reel, story, carousel, article."),
+        member_id: z.string().optional().describe("Workspace member ID."),
+      },
+    },
+    async (args) => runSafely(() => {
       const { workspace_id, ...filters } = args;
       return publerRequest({ method: "GET", path: "/posts", workspaceId: requireWorkspace({ workspace_id }), query: buildQuery(filters) });
-    }
+    })
+  );
 
-    case "create_draft_post": {
+  server.registerTool(
+    "create_draft_post",
+    {
+      title: "Create Publer draft post",
+      description: "Create a Publer draft post through /posts/schedule. Defaults bulk.state to draft when not provided.",
+      inputSchema: {
+        ...workspaceSchema,
+        bulk: bulkSchema,
+      },
+    },
+    async (args) => runSafely(() => {
       const bulk = { ...(args.bulk || {}) };
       if (!bulk.state) bulk.state = "draft";
       return publerRequest({ method: "POST", path: "/posts/schedule", workspaceId: requireWorkspace(args), body: { bulk } });
-    }
+    })
+  );
 
-    case "schedule_post":
+  server.registerTool(
+    "schedule_post",
+    {
+      title: "Schedule Publer post",
+      description: "Schedule an approved Publer post through /posts/schedule. Requires confirmed=true after final copy, accounts, media, and timing are approved.",
+      inputSchema: {
+        ...workspaceSchema,
+        bulk: bulkSchema,
+        confirmed: z.boolean().describe("Must be true after final content, accounts, media, and schedule time are approved."),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async (args) => runSafely(() => {
       if (args.confirmed !== true) throw new Error("schedule_post requires confirmed=true after final content, accounts, media, and timing are approved.");
       return publerRequest({ method: "POST", path: "/posts/schedule", workspaceId: requireWorkspace(args), body: { bulk: args.bulk } });
+    })
+  );
 
-    case "publish_now":
+  server.registerTool(
+    "publish_now",
+    {
+      title: "Publish Publer post now",
+      description: "Immediately publish an approved Publer post through /posts/schedule/publish. Requires confirmed=true after final copy, accounts, and media are approved.",
+      inputSchema: {
+        ...workspaceSchema,
+        bulk: bulkSchema,
+        confirmed: z.boolean().describe("Must be true after final content, accounts, and media are approved for immediate publishing."),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async (args) => runSafely(() => {
       if (args.confirmed !== true) throw new Error("publish_now requires confirmed=true after final content, accounts, and media are approved for immediate publishing.");
       return publerRequest({ method: "POST", path: "/posts/schedule/publish", workspaceId: requireWorkspace(args), body: { bulk: args.bulk } });
+    })
+  );
 
-    case "get_job_status":
-      return publerRequest({ method: "GET", path: `/job_status/${encodeURIComponent(args.job_id)}`, workspaceId: requireWorkspace(args) });
+  server.registerTool(
+    "get_job_status",
+    {
+      title: "Get Publer job status",
+      description: "Check Publer async job status after creating, scheduling, or publishing posts.",
+      inputSchema: {
+        ...workspaceSchema,
+        job_id: z.string().describe("Publer job ID returned by a create/schedule/publish request."),
+      },
+    },
+    async (args) => runSafely(() => publerRequest({ method: "GET", path: `/job_status/${encodeURIComponent(args.job_id)}`, workspaceId: requireWorkspace(args) }))
+  );
 
-    default:
-      throw new Error(`Unknown tool: ${name}`);
+  return server;
+}
+
+const httpServer = createServer(async (req, res) => {
+  if (!req.url) {
+    res.writeHead(400).end("Missing URL");
+    return;
   }
-}
 
-function rpcResult(id, result) {
-  return { jsonrpc: "2.0", id, result };
-}
+  const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
 
-function rpcError(id, code, message, data) {
-  return { jsonrpc: "2.0", id, error: { code, message, ...(data === undefined ? {} : { data }) } };
-}
-
-async function handleRpc(message) {
-  const { id, method, params = {} } = message || {};
-
-  if (!method) return rpcError(id ?? null, -32600, "Invalid JSON-RPC request");
-
-  if (method === "initialize") {
-    return rpcResult(id, {
-      protocolVersion: params.protocolVersion || "2024-11-05",
-      capabilities: { tools: {} },
-      serverInfo,
-      instructions: "Use Publer tools for Sands Roofing social account discovery, post drafts, scheduled posts, immediate publishing after approval, and job status checks.",
+  if (req.method === "OPTIONS" && url.pathname === MCP_PATH) {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "content-type, mcp-session-id, authorization, x-mcp-auth",
+      "Access-Control-Expose-Headers": "Mcp-Session-Id",
     });
+    res.end();
+    return;
   }
 
-  if (method === "notifications/initialized") {
-    return undefined;
-  }
-
-  if (method === "tools/list") {
-    return rpcResult(id, { tools: toolDefinitions });
-  }
-
-  if (method === "tools/call") {
-    try {
-      const toolName = params.name;
-      const args = params.arguments || {};
-      const data = await callTool(toolName, args);
-      return rpcResult(id, {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(data, null, 2),
-          },
-        ],
-      });
-    } catch (error) {
-      return rpcResult(id, {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ error: error.message, details: error.details }, null, 2),
-          },
-        ],
-      });
-    }
-  }
-
-  return rpcError(id, -32601, `Method not found: ${method}`);
-}
-
-async function handleRequest(req, res) {
-  if (req.method === "OPTIONS") {
-    return jsonResponse(res, 204);
-  }
-
-  if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
-    return jsonResponse(res, 200, {
+  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
+    json(res, 200, {
       ok: true,
-      server: serverInfo,
+      server: { name: "sands-publer-mcp", version: "1.0.0" },
       publer_configured: Boolean(PUBLER_API_KEY),
       auth_required: Boolean(MCP_AUTH_TOKEN),
-      endpoints: ["POST /mcp"],
+      endpoint: MCP_PATH,
     });
+    return;
   }
 
-  if (req.method !== "POST" || req.url !== "/mcp") {
-    return jsonResponse(res, 404, { error: "Not found. Use POST /mcp for MCP JSON-RPC." });
-  }
-
-  if (!isAuthorized(req)) return unauthorized(res);
-
-  try {
-    const body = await parseBody(req);
-    if (Array.isArray(body)) {
-      const responses = (await Promise.all(body.map(handleRpc))).filter(Boolean);
-      return responses.length ? jsonResponse(res, 200, responses) : jsonResponse(res, 204);
+  const MCP_METHODS = new Set(["POST", "GET", "DELETE"]);
+  if (url.pathname === MCP_PATH && req.method && MCP_METHODS.has(req.method)) {
+    if (!isAuthorized(req)) {
+      res.writeHead(401, {
+        "content-type": "application/json",
+        "www-authenticate": "Bearer",
+      });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
     }
 
-    const response = await handleRpc(body);
-    return response ? jsonResponse(res, 200, response) : jsonResponse(res, 204);
-  } catch (error) {
-    return jsonResponse(res, 400, rpcError(null, -32700, error.message));
-  }
-}
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
-import("node:http").then(({ createServer }) => {
-  createServer(handleRequest).listen(PORT, "0.0.0.0", () => {
-    console.log(`Sands Publer MCP server listening on port ${PORT}`);
-  });
+    const server = createPublerServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("Error handling MCP request:", error);
+      if (!res.headersSent) {
+        res.writeHead(500).end("Internal server error");
+      }
+    }
+    return;
+  }
+
+  res.writeHead(404).end("Not Found");
+});
+
+httpServer.listen(PORT, "0.0.0.0", () => {
+  console.log(`Sands Publer MCP server listening on http://0.0.0.0:${PORT}${MCP_PATH}`);
 });
