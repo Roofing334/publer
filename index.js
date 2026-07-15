@@ -60,21 +60,7 @@ function buildQuery(params = {}) {
   return query ? `?${query}` : "";
 }
 
-async function publerRequest({ method, path, workspaceId, query, body }) {
-  requireApiKey();
-  const headers = {
-    Authorization: `Bearer-API ${PUBLER_API_KEY}`,
-    Accept: "application/json",
-  };
-  if (workspaceId) headers["Publer-Workspace-Id"] = workspaceId;
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-
-  const response = await fetch(`${PUBLER_API_BASE}${path}${query || ""}`, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-
+async function readPublerResponse(response) {
   const text = await response.text();
   let data;
   try {
@@ -90,6 +76,64 @@ async function publerRequest({ method, path, workspaceId, query, body }) {
   }
 
   return data;
+}
+
+async function publerRequest({ method, path, workspaceId, query, body }) {
+  requireApiKey();
+  const headers = {
+    Authorization: `Bearer-API ${PUBLER_API_KEY}`,
+    Accept: "application/json",
+  };
+  if (workspaceId) headers["Publer-Workspace-Id"] = workspaceId;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+
+  const response = await fetch(`${PUBLER_API_BASE}${path}${query || ""}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+  return readPublerResponse(response);
+}
+
+function parseBase64File(fileBase64, mimeType) {
+  const dataUrlMatch = /^data:([^;]+);base64,(.*)$/s.exec(fileBase64);
+  if (dataUrlMatch) {
+    return {
+      buffer: Buffer.from(dataUrlMatch[2], "base64"),
+      mimeType: mimeType || dataUrlMatch[1],
+    };
+  }
+
+  return {
+    buffer: Buffer.from(fileBase64, "base64"),
+    mimeType: mimeType || "application/octet-stream",
+  };
+}
+
+async function publerMediaUpload({ workspaceId, filename, mimeType, fileBase64, directUpload, inLibrary }) {
+  requireApiKey();
+  const parsed = parseBase64File(fileBase64, mimeType);
+  const form = new FormData();
+  const blob = new Blob([parsed.buffer], { type: parsed.mimeType });
+
+  form.append("file", blob, filename);
+  if (directUpload !== undefined) form.append("direct_upload", String(directUpload));
+  if (inLibrary !== undefined) form.append("in_library", String(inLibrary));
+
+  const headers = {
+    Authorization: `Bearer-API ${PUBLER_API_KEY}`,
+    Accept: "application/json",
+    "Publer-Workspace-Id": workspaceId,
+  };
+
+  const response = await fetch(`${PUBLER_API_BASE}/media`, {
+    method: "POST",
+    headers,
+    body: form,
+  });
+
+  return readPublerResponse(response);
 }
 
 function textResult(data) {
@@ -132,7 +176,7 @@ const bulkSchema = z.record(z.any()).describe("Publer bulk payload. Include stat
 function createPublerServer() {
   const server = new McpServer({
     name: "sands-publer-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   server.registerTool(
@@ -153,6 +197,80 @@ function createPublerServer() {
       inputSchema: workspaceSchema,
     },
     async (args) => runSafely(() => publerRequest({ method: "GET", path: "/accounts", workspaceId: requireWorkspace(args) }))
+  );
+
+  server.registerTool(
+    "list_media",
+    {
+      title: "List Publer media",
+      description: "List Publer media library items by page, search query, type, source, usage status, or IDs.",
+      inputSchema: {
+        ...workspaceSchema,
+        page: z.number().int().optional().describe("Page number."),
+        query: z.string().optional().describe("Search text for media library items."),
+        ids: z.array(z.string()).optional().describe("Publer media IDs to filter by."),
+        type: z.string().optional().describe("Media type such as image, video, gif, pdf, or document."),
+        source: z.string().optional().describe("Media source filter when supported by Publer."),
+        used: z.boolean().optional().describe("Filter by whether the media has been used in posts."),
+      },
+    },
+    async (args) => runSafely(() => {
+      const { workspace_id, ...filters } = args;
+      return publerRequest({ method: "GET", path: "/media", workspaceId: requireWorkspace({ workspace_id }), query: buildQuery(filters) });
+    })
+  );
+
+  server.registerTool(
+    "upload_media_file",
+    {
+      title: "Upload Publer media file",
+      description: "Upload an image, video, GIF, or document to Publer from base64 file content. Use this for local workspace files by reading the file and passing base64 content.",
+      inputSchema: {
+        ...workspaceSchema,
+        filename: z.string().describe("Original filename to send to Publer, including extension."),
+        mime_type: z.string().optional().describe("File MIME type, such as image/jpeg or video/mp4. Data URL MIME type is used when present."),
+        file_base64: z.string().describe("Base64 file content. A data URL is also accepted."),
+        direct_upload: z.boolean().optional().default(false).describe("Whether Publer should direct-upload to its cloud storage."),
+        in_library: z.boolean().optional().default(true).describe("Whether to save the uploaded media in the Publer media library."),
+      },
+    },
+    async (args) => runSafely(() => publerMediaUpload({
+      workspaceId: requireWorkspace(args),
+      filename: args.filename,
+      mimeType: args.mime_type,
+      fileBase64: args.file_base64,
+      directUpload: args.direct_upload,
+      inLibrary: args.in_library,
+    }))
+  );
+
+  server.registerTool(
+    "upload_media_from_url",
+    {
+      title: "Upload Publer media from URL",
+      description: "Create a Publer media upload job from one or more already-public HTTPS media URLs.",
+      inputSchema: {
+        ...workspaceSchema,
+        media: z.array(z.object({
+          url: z.string().url().describe("Already-public HTTPS URL for the media file."),
+          name: z.string().optional().describe("Optional display name or filename for the media."),
+        })).min(1).describe("List of media URLs and optional metadata."),
+        type: z.enum(["single", "thumbnail", "bulk"]).optional().default("single").describe("Publer upload type."),
+        direct_upload: z.boolean().optional().default(false).describe("Whether Publer should direct-upload to its cloud storage."),
+        in_library: z.boolean().optional().default(true).describe("Whether to save the uploaded media in the Publer media library."),
+      },
+    },
+    async (args) => runSafely(() => publerRequest({
+      method: "POST",
+      path: "/media/from-url",
+      workspaceId: requireWorkspace(args),
+      body: {
+        media: args.media,
+        type: args.type,
+        direct_upload: args.direct_upload,
+        in_library: args.in_library,
+      },
+    }))
   );
 
   server.registerTool(
@@ -245,10 +363,10 @@ function createPublerServer() {
     "get_job_status",
     {
       title: "Get Publer job status",
-      description: "Check Publer async job status after creating, scheduling, or publishing posts.",
+      description: "Check Publer async job status after creating, scheduling, publishing, or URL media-upload jobs.",
       inputSchema: {
         ...workspaceSchema,
-        job_id: z.string().describe("Publer job ID returned by a create/schedule/publish request."),
+        job_id: z.string().describe("Publer job ID returned by a create/schedule/publish or URL media-upload request."),
       },
     },
     async (args) => runSafely(() => publerRequest({ method: "GET", path: `/job_status/${encodeURIComponent(args.job_id)}`, workspaceId: requireWorkspace(args) }))
@@ -279,7 +397,7 @@ const httpServer = createServer(async (req, res) => {
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
     json(res, 200, {
       ok: true,
-      server: { name: "sands-publer-mcp", version: "1.0.0" },
+      server: { name: "sands-publer-mcp", version: "1.1.0" },
       publer_configured: Boolean(PUBLER_API_KEY),
       auth_required: Boolean(MCP_AUTH_TOKEN),
       endpoint: MCP_PATH,
